@@ -1,0 +1,320 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_mac.h>
+#include <ESP_Mail_Client.h>
+
+
+#define BUTTON_PIN 34  
+#define RELAY_PIN 33  
+#define ESPNOW_CHANNEL 6
+
+
+// WiFi credentials
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
+
+
+// Email settings
+#define SMTP_HOST "smtp.gmail.com"
+#define SMTP_PORT 465
+const char* email_sender = "YOUR_SENDER";
+const char* email_password = "YOUR_PASSWORD"; 
+const char* email_recipient = "YOUR_RECIPENT";
+
+
+// Structure for button state
+typedef struct {
+    bool buttonState;
+} __attribute__((packed)) button_data_t;
+
+
+// Structure for motion detection state
+typedef struct {
+    bool motionDetected;
+} __attribute__((packed)) esp_now_data_t;
+
+
+
+
+// Global variables
+button_data_t buttonData;
+esp_now_peer_info_t peerInfo;
+bool lastButtonState = false;
+bool relayActive = false;
+unsigned long relayStartTime = 0;
+unsigned long buttonPressTime = 0;
+bool waitingToSend = false;
+bool motionDetectedWaiting = false;
+unsigned long motionDetectionTime = 0;
+bool relayCountDownStarted = false;
+bool isEmailSending = false;
+volatile bool shouldStopRelay = false;
+bool restartRequested = false;
+
+
+// Email objects
+SMTPSession smtp;
+ESP_Mail_Session session;
+
+
+
+
+// Function to send email notification
+void sendEmail() {
+    isEmailSending = true;
+   
+    // Try to connect to WiFi with a short timeout
+    Serial.println("Attempting to connect to WiFi...");
+    WiFi.begin(ssid, password);
+   
+    // Wait up to 5 seconds for WiFi connection
+    unsigned long wifiStartTime = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - wifiStartTime > 5000) { // 5 second timeout
+            Serial.println("WiFi connection failed - continuing without sending email");
+            WiFi.disconnect();
+            isEmailSending = false;
+           
+            // Reinitialize ESP-NOW and continue with the process
+            initESPNow();
+            return;
+        }
+       
+        // Check button state during connection attempt
+        if (!digitalRead(BUTTON_PIN)) {
+            digitalWrite(RELAY_PIN, HIGH);
+            relayActive = false;
+            relayCountDownStarted = false;
+            shouldStopRelay = true;
+            Serial.println("Relay deactivated by button while connecting to WiFi");
+            WiFi.disconnect();
+            isEmailSending = false;
+            initESPNow();
+            return;
+        }
+        delay(100);
+    }
+   
+    // If we got here, we're connected to WiFi
+    Serial.println("Connected to WiFi");
+   
+    // Configure email session
+    session.server.host_name = SMTP_HOST;
+    session.server.port = SMTP_PORT;
+    session.login.email = email_sender;
+    session.login.password = email_password;
+    session.login.user_domain = "";
+   
+    // Set up the message
+    SMTP_Message message;
+    message.sender.name = "SENDER_NAME";
+    message.sender.email = email_sender;
+    message.subject = "Motion Detected";
+    message.addRecipient("User", email_recipient);
+   
+    if (shouldStopRelay) {
+        message.text.content = "Motion was detected, but the system was deactivated before completion.";
+    } else {
+        message.text.content = "Motion has been detected and the relay system has been activated.";
+    }
+   
+    // Try to connect to SMTP server with timeout
+    bool connected = false;
+    unsigned long smtpStartTime = millis();
+    while (!connected && (millis() - smtpStartTime < 5000)) { 
+        if (!digitalRead(BUTTON_PIN)) {
+            digitalWrite(RELAY_PIN, HIGH);
+            relayActive = false;
+            relayCountDownStarted = false;
+            shouldStopRelay = true;
+            Serial.println("Relay deactivated by button while connecting to SMTP");
+            break;
+        }
+       
+        connected = smtp.connect(&session);
+        if (!connected) {
+            delay(100);
+        }
+    }
+   
+    if (connected) {
+        // Try to send email with timeout
+        bool sendSuccess = false;
+        unsigned long sendStartTime = millis();
+        while (!sendSuccess && (millis() - sendStartTime < 5000)) { 
+            if (!digitalRead(BUTTON_PIN)) {
+                digitalWrite(RELAY_PIN, HIGH);
+                relayActive = false;
+                relayCountDownStarted = false;
+                shouldStopRelay = true;
+                Serial.println("Relay deactivated by button while sending email");
+                break;
+            }
+           
+            sendSuccess = MailClient.sendMail(&smtp, &message);
+            if (!sendSuccess) {
+                delay(100);
+            }
+        }
+       
+        if (sendSuccess) {
+            Serial.println("Email sent successfully!");
+        } else {
+            Serial.println("Failed to send email - continuing with process");
+        }
+    } else {
+        Serial.println("SMTP connection failed - continuing with process");
+    }
+   
+    // Clean up and reinitialize ESP-NOW
+    WiFi.disconnect();
+    Serial.println("Disconnected from WiFi");
+    initESPNow();
+   
+    isEmailSending = false;
+    shouldStopRelay = false;
+}
+
+
+
+
+// Callback function for receiving motion detection data
+void onDataReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    if (len == sizeof(esp_now_data_t)) {
+        esp_now_data_t receivedMotionData;
+        memcpy(&receivedMotionData, data, sizeof(receivedMotionData));      
+        if (receivedMotionData.motionDetected) {
+            Serial.printf("Received motion detected from " MACSTR "\n", MAC2STR(info->src_addr));
+
+
+            // Only start the countdown if it hasn't already been started
+            if (!relayCountDownStarted) {
+                motionDetectedWaiting = true;
+                motionDetectionTime = millis();
+                Serial.println("Motion detected, waiting 30 seconds before activating relay.");
+            } else {
+                Serial.println("Motion detected but countdown already started, ignoring further detections.");
+            }
+        }
+    }
+}
+
+
+// Function to activate the relay for 2 minutes
+void activateRelay() {
+    if (buttonData.buttonState) {
+        digitalWrite(RELAY_PIN, LOW);
+        relayActive = true;
+        relayStartTime = millis();
+      
+       
+        // Send email notification
+        sendEmail();
+    } else {
+        Serial.println("Relay not activated. Button is OFF.");
+    }
+}
+
+
+
+
+void initESPNow() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setChannel(ESPNOW_CHANNEL);
+    WiFi.disconnect();
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW Initialization failed");
+        return;
+    }
+    memcpy(peerInfo.peer_addr, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+    peerInfo.channel = ESPNOW_CHANNEL;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add broadcast peer");
+        return;
+    }
+    esp_now_register_recv_cb(onDataReceive);
+}
+void setup() {
+    Serial.begin(9600);
+    delay(3000);  
+    Serial.println("Startup complete"); 
+   
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, HIGH);  /
+    initESPNow();  
+   
+    // Set initial states
+    shouldStopRelay = false;
+    isEmailSending = false;
+}
+
+
+
+
+void loop() {
+    // Read button state
+    buttonData.buttonState = digitalRead(BUTTON_PIN);
+   
+    // Check if the button state has changed
+    if (buttonData.buttonState != lastButtonState) {
+        lastButtonState = buttonData.buttonState;
+
+
+        // If button state changes to OFF (released)
+        if (!buttonData.buttonState) {
+            digitalWrite(RELAY_PIN, HIGH);
+            relayActive = false;
+            relayCountDownStarted = false;
+            shouldStopRelay = true;
+            Serial.println("Relay deactivated by button.");           
+            esp_now_send(peerInfo.peer_addr, (uint8_t *)&buttonData, sizeof(buttonData));
+            Serial.println("Button OFF state sent immediately.");
+            delay(50);
+            ESP.restart();
+        }
+        // If button state changes to ON (pressed)
+        else {
+            buttonPressTime = millis();
+            waitingToSend = true;
+            Serial.println("Button pressed, waiting to send ON state.");
+        }
+    }
+    // If waiting to send, check if one second has passed
+    if (waitingToSend && (millis() - buttonPressTime >= 60000)) {
+        if (buttonData.buttonState) {
+            esp_now_send(peerInfo.peer_addr, (uint8_t *)&buttonData, sizeof(buttonData));
+            Serial.println("Button ON state sent after delay.");
+            waitingToSend = false;
+        }
+    }
+
+
+    // Check if motion was detected and 30 seconds have passed
+    if (motionDetectedWaiting && (millis() - motionDetectionTime >= 30000)) {
+        motionDetectedWaiting = false;
+        Serial.println("30 seconds passed after motion detection.");
+
+
+        // Only start the relay if it hasn't started already
+        if (!relayCountDownStarted) {
+            activateRelay();
+            relayCountDownStarted = true;
+            Serial.println("Relay countdown started.");
+        } else {
+            Serial.println("Relay countdown already started, not restarting.");
+        }
+    }
+
+
+    // Check if the relay needs to be deactivated after 2 minutes
+    if (relayActive && (millis() - relayStartTime >= 120000)) {
+        digitalWrite(RELAY_PIN, HIGH);
+        relayActive = false;
+        relayCountDownStarted = false;
+        Serial.println("Relay deactivated after 2 minutes.");
+    }
+    delay(100);
+}
+                                                                                                                                            
