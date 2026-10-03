@@ -1,0 +1,481 @@
+#include "Arduino.h"
+#include <WiFi.h>
+#include "esp_camera.h"
+#include "camera_pin.h"
+#include <esp_now.h>
+#include <esp_mac.h>
+#include <LittleFS.h>
+#include <FS.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "driver/rtc_io.h"
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h>
+
+
+// Constants
+#define ESPNOW_CHANNEL 6
+#define Flash_Pin 4
+#define PIR_Pin 13
+#define MAX_PHOTOS 2
+#define PHOTO_INTERVAL 15000 // 15 seconds
+#define UPLOAD_WAIT_TIME 30000 // 30 seconds before uploading
+
+
+// WiFi Configuration
+const char* WIFI_SSID = "YOUR_SSID";
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";
+const unsigned long WIFI_TIMEOUT = 20000; 
+const unsigned long WIFI_RETRY_DELAY = 5000; 
+
+
+
+
+// Firebase credentials
+#define API_KEY "YOUR_API_KEY"
+#define USER_EMAIL "YOUR_EMAIL"
+#define USER_PASSWORD "YOUR_PASSWORD"
+#define STORAGE_BUCKET_ID "YOUR_STORAGE_BUCKET"
+#define FILE_PHOTO_PATH "/photo.jpg"
+
+
+
+
+// Structs for ESP-NOW communication
+typedef struct __attribute__((packed)) {
+    bool buttonState;
+} button_data_t;
+
+
+
+
+typedef struct __attribute__((packed)) {
+    bool motionDetected;
+} esp_now_data_t;
+
+
+
+
+esp_now_data_t dataToSend;
+
+
+
+
+// Global variables
+bool buttonState = false;
+bool motionMessageSent = false;
+unsigned long motionDetectedTime = 0;
+bool motionState = false;
+bool isCapturing = false;
+int photoCount = 0;
+bool uploadPending = false;
+unsigned long uploadStartTime = 0;
+bool sessionActive = false;
+unsigned long lastDisplayTime = 0;
+unsigned long lastWifiRetry = 0;
+bool uploadComplete = false; 
+
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig configF;
+
+
+// Sending motion detection state
+void sendMotionState(bool motionDetected) {
+    dataToSend.motionDetected = motionDetected;
+    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&dataToSend, sizeof(dataToSend));
+    if (result == ESP_OK) {
+        Serial.println("Sent motion state successfully");
+    } else {
+        Serial.println("Error sending motion state");
+    }
+}
+
+
+// Camera flush
+void blinkFlash(int times) {
+    const int FLASH_DURATION = 200;
+    const int PAUSE_DURATION = 200;
+    for (int i = 0; i < times; i++) {
+        digitalWrite(Flash_Pin, HIGH);
+        delay(FLASH_DURATION);
+        digitalWrite(Flash_Pin, LOW);
+        delay(PAUSE_DURATION);
+    }
+}
+
+
+void initFlash() {
+    pinMode(Flash_Pin, OUTPUT);
+    digitalWrite(Flash_Pin, LOW);
+}
+// Store on ESP32-cam by using LittleFS
+void capturePhotoSaveLittleFS() {
+    delay(200);
+    digitalWrite(Flash_Pin, HIGH);
+    delay(100);
+   
+    // Clear any pending frames
+    camera_fb_t* fb = NULL;
+    for(int i = 0; i < 3; i++) {
+        if(fb) {
+            esp_camera_fb_return(fb);
+            delay(10);
+        }
+        fb = esp_camera_fb_get();
+    }
+       
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        digitalWrite(Flash_Pin, LOW);
+        return;
+    }
+
+
+    File file = LittleFS.open(FILE_PHOTO_PATH, FILE_WRITE);
+    if (!file) {
+        Serial.println("Failed to open file in writing mode");
+    } else {
+        file.write(fb->buf, fb->len);
+        Serial.print("The picture has been saved - Size: ");
+        Serial.print(fb->len);
+        Serial.println(" bytes");
+    }
+    file.close();
+    esp_camera_fb_return(fb);
+    digitalWrite(Flash_Pin, LOW);
+}
+
+
+
+
+void deletePhotos() {
+    if (LittleFS.exists(FILE_PHOTO_PATH)) {
+        if (LittleFS.remove(FILE_PHOTO_PATH)) {
+            Serial.println("Photo deleted from LittleFS.");
+        } else {
+            Serial.println("Failed to delete photo from LittleFS.");
+        }
+    }
+}
+
+
+
+
+void initLittleFS() {
+    if (!LittleFS.begin(true)) {
+        Serial.println("An Error has occurred while mounting LittleFS");
+        ESP.restart();
+    } else {
+        Serial.println("LittleFS mounted successfully");
+    }
+}
+
+
+void initCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_sscb_sda = SIOD_GPIO_NUM;
+    config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.xclk_freq_hz = 16000000;  // Reduced from 20MHz to 16MHz
+    config.pixel_format = PIXFORMAT_JPEG;
+    if (psramFound()) {
+        config.frame_size = FRAMESIZE_UXGA;
+        config.jpeg_quality = 7;
+        config.fb_count = 1;
+        config.grab_mode = CAMERA_GRAB_LATEST;
+    } else {
+        config.frame_size = FRAMESIZE_SVGA;
+        config.jpeg_quality = 9;
+        config.fb_count = 1;
+    }
+    // Additional camera settings for better image quality
+    sensor_t * s = esp_camera_sensor_get();
+    if (s) {
+        // Adjust sensor settings after initialization
+        s->set_brightness(s, 1);      // Increase brightness slightly (-2 to 2)
+        s->set_contrast(s, 1);        // Increase contrast slightly (-2 to 2)
+        s->set_saturation(s, 0);      // Normal saturation (-2 to 2)
+        s->set_special_effect(s, 0);  // No special effects
+        s->set_whitebal(s, 1);        // Enable white balance
+        s->set_awb_gain(s, 1);        // Enable auto white balance gain
+        s->set_wb_mode(s, 0);         // Auto white balance mode
+        s->set_exposure_ctrl(s, 1);   // Enable auto exposure
+        s->set_aec2(s, 1);           // Enable auto exposure (DSP)
+        s->set_gain_ctrl(s, 1);      // Enable auto gain control
+        s->set_agc_gain(s, 0);       // Set auto gain control gain
+        s->set_gainceiling(s, (gainceiling_t)6);  // Set max gain ceiling
+        s->set_bpc(s, 1);            // Enable black pixel correction
+        s->set_wpc(s, 1);            // Enable white pixel correction
+        s->set_raw_gma(s, 1);        // Enable gamma correction
+        s->set_lenc(s, 1);           // Enable lens correction
+        s->set_hmirror(s, 0);        // Disable horizontal mirror
+        s->set_vflip(s, 0);          // Disable vertical flip
+        s->set_dcw(s, 1);            // Enable downsize crop
+    }
+   
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed with error 0x%x\n", err);
+    }
+}
+
+
+void initFirebase() {
+    configF.api_key = API_KEY;
+    auth.user.email = USER_EMAIL;
+    auth.user.password = USER_PASSWORD;
+    Firebase.begin(&configF, &auth);
+    Firebase.reconnectWiFi(true);
+}
+bool connectToWiFi() {
+    if (WiFi.status() == WL_CONNECTED) {
+        return true;
+    }  
+    Serial.println("\nAttempting to connect to WiFi...");
+    esp_now_deinit();
+    delay(100);
+    WiFi.disconnect(true);
+    delay(1000);
+   
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+   
+    unsigned long startAttemptTime = millis();
+   
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < WIFI_TIMEOUT) {
+        Serial.print(".");
+        delay(500);
+    }
+    Serial.println();
+   
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("Connected to WiFi! IP: ");
+        Serial.println(WiFi.localIP());
+        initFirebase();
+        return true;
+    } else {
+        Serial.println("WiFi connection failed!");
+        WiFi.disconnect(true);
+        delay(100);
+        reinitESPNow();
+        return false;
+    }
+}
+
+
+void reinitESPNow() {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.setChannel(ESPNOW_CHANNEL);
+   
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW Re-initialization failed");
+        return;
+    }  
+    esp_now_register_recv_cb(onDataReceive);
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+    peerInfo.channel = ESPNOW_CHANNEL;
+    peerInfo.encrypt = false;
+   
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add broadcast peer");
+        return;
+    }  
+    Serial.println("ESP-NOW reinitialized successfully");
+}
+
+
+void uploadPhoto() {
+    if (!LittleFS.exists(FILE_PHOTO_PATH)) {
+        Serial.println("Error: Photo file not found!");
+        uploadPending = false;
+        reinitESPNow();
+        return;
+    }  
+    Serial.println("Starting Firebase upload...");
+    String timestamp = String(millis());
+    String uniqueFileName = "/data/photo_" + timestamp + ".jpg";
+
+
+    if (Firebase.Storage.upload(&fbdo, STORAGE_BUCKET_ID, FILE_PHOTO_PATH, mem_storage_type_flash, uniqueFileName, "image/jpeg")) {
+        Serial.printf("Upload successful: %s\n", fbdo.downloadURL().c_str());
+        deletePhotos();
+        Serial.println("Photo uploaded and deleted from local storage");
+
+
+        // Mark the upload as complete and stop motion detection
+        uploadPending = false;
+        uploadComplete = true;  // Set the flag to true after upload
+        sessionActive = false;
+        motionMessageSent = false;
+        isCapturing = false;
+        photoCount = 0;
+        blinkFlash(2);
+        // Disconnect WiFi and reset ESP-NOW
+        WiFi.disconnect(true);
+        delay(100);
+        reinitESPNow();
+    } else {
+        Serial.printf("Upload failed: %s\n", fbdo.errorReason().c_str());
+        reinitESPNow();
+    }
+}
+
+
+void handleUpload() {
+    if (uploadPending && !isCapturing) {
+        unsigned long currentMillis = millis();
+        unsigned long elapsedWaitTime = currentMillis - uploadStartTime;
+
+
+        if (elapsedWaitTime >= UPLOAD_WAIT_TIME) {
+            if (currentMillis - lastWifiRetry >= WIFI_RETRY_DELAY) {
+                lastWifiRetry = currentMillis;
+                Serial.println("Attempting to connect for upload...");
+                if (connectToWiFi()) {
+                    uploadPhoto();
+                } else {
+                    Serial.println("Will retry WiFi connection in 5 seconds...");
+                }
+            }
+        }
+    }
+}
+
+
+void onDataReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    if (len == sizeof(button_data_t)) {
+        button_data_t receivedButtonData;
+        memcpy(&receivedButtonData, data, sizeof(receivedButtonData));
+        buttonState = receivedButtonData.buttonState;
+
+
+        if (!buttonState) {
+            // When button is released, reset states
+            if (!uploadPending) {
+                sessionActive = false;
+                motionMessageSent = false;
+                isCapturing = false;
+                photoCount = 0;
+                deletePhotos();
+                uploadComplete = false; // Reset uploadComplete flag when button is released
+                blinkFlash(4);
+                Serial.println("Button released - All states reset");
+
+
+                delay(1000);
+                ESP.restart();
+            } else {
+                Serial.println("Button released but upload is still pending - waiting for completion");
+            }
+        } else {
+            delay(2000);
+            Serial.println("Button pressed - System armed");
+            blinkFlash(2);
+        }
+    }
+}
+
+
+void handlePhotoCapture() {
+    unsigned long currentMillis = millis();
+   
+    if (photoCount > 0 && (currentMillis - motionDetectedTime >= (MAX_PHOTOS - photoCount) * PHOTO_INTERVAL)) {
+        Serial.printf("Taking photo %d of %d\n", (MAX_PHOTOS - photoCount + 1), MAX_PHOTOS);
+        capturePhotoSaveLittleFS();
+        photoCount--;
+       
+        if (photoCount == 0) {
+            isCapturing = false;
+            uploadStartTime = millis();
+            uploadPending = true;
+            Serial.println("All photos captured. Waiting 30 seconds before upload...");
+        }
+    }
+}
+
+
+void checkMotion() {
+    // If upload is complete, ignore further motion detection
+    if (uploadComplete) {
+        return; // Skip motion detection if upload is complete
+    }
+
+
+    if (buttonState && !isCapturing && !uploadPending) {
+        motionState = digitalRead(PIR_Pin);
+
+
+        if (motionState && !sessionActive && !motionMessageSent) {
+            motionDetectedTime = millis();
+            motionMessageSent = true;
+            sendMotionState(true);
+            isCapturing = true;
+            sessionActive = true;
+            photoCount = MAX_PHOTOS;
+            Serial.println("Motion detected, starting capture session.");
+        }
+    }
+    if (isCapturing && sessionActive) {
+        handlePhotoCapture();
+    }
+    handleUpload();
+}
+
+
+void initESPNow() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setChannel(ESPNOW_CHANNEL);
+    WiFi.disconnect();
+
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW Initialization failed");
+        ESP.restart();
+    }
+    esp_now_register_recv_cb(onDataReceive);
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, "\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+    peerInfo.channel = ESPNOW_CHANNEL;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+}
+
+
+void setup() {
+    Serial.begin(9600);
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+    delay(2000);
+    initCamera();
+    initFlash();
+    pinMode(PIR_Pin, INPUT);
+    initLittleFS();
+    initESPNow();
+    Serial.println("Setup complete - System ready");
+}
+
+
+void loop() {
+    checkMotion();
+}
